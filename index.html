@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Quote Call Bridge</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #0f1419; color: #e8eef5; font-family: system-ui, sans-serif; }
+    .wrap { display: flex; flex-direction: column; height: 100%; }
+    .videos { flex: 1; display: grid; grid-template-columns: 1fr; position: relative; min-height: 0; background: #000; }
+    video#remote { width: 100%; height: 100%; object-fit: contain; background: #000; }
+    video#local { position: absolute; right: 12px; bottom: 12px; width: 28%; max-width: 220px; border-radius: 10px; border: 1px solid #2e3d4f; }
+    .status { padding: 8px 12px; font-size: 12px; color: #8fa3b8; border-top: 1px solid #2e3d4f; }
+    .err { color: #e05555; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="videos">
+      <video id="remote" autoplay playsinline></video>
+      <video id="local" autoplay playsinline muted></video>
+    </div>
+    <div class="status" id="status">Bridge pronto (HTTPS)…</div>
+  </div>
+  <script>
+(function () {
+  var statusEl = document.getElementById('status');
+  var localEl = document.getElementById('local');
+  var remoteEl = document.getElementById('remote');
+  var pc = null;
+  var localStream = null;
+  var screenStream = null;
+  var parentOrigin = '*';
+
+  function setStatus(t, isErr) {
+    statusEl.textContent = t || '';
+    statusEl.className = 'status' + (isErr ? ' err' : '');
+  }
+
+  function post(msg) {
+    try {
+      if (window.parent && window.parent !== window) {
+        window.parent.postMessage(Object.assign({ source: 'quote-call-bridge' }, msg), parentOrigin);
+      }
+    } catch (e) { /* ignore */ }
+  }
+
+  async function getMedia(audio, video) {
+    var md = navigator.mediaDevices;
+    if (!md || typeof md.getUserMedia !== 'function') {
+      throw new Error('getUserMedia non disponibile nel bridge');
+    }
+    try {
+      return await md.getUserMedia({ audio: !!audio, video: !!video });
+    } catch (err) {
+      if (video) {
+        return await md.getUserMedia({ audio: true, video: false });
+      }
+      throw err;
+    }
+  }
+
+  async function ensurePc(iceServers) {
+    if (pc) return pc;
+    pc = new RTCPeerConnection({ iceServers: iceServers || [{ urls: 'stun:stun.l.google.com:19302' }] });
+    pc.onicecandidate = function (ev) {
+      if (ev.candidate) post({ type: 'signal', signal: { candidate: ev.candidate } });
+    };
+    pc.ontrack = function (ev) {
+      var stream = (ev.streams && ev.streams[0]) || new MediaStream([ev.track]);
+      remoteEl.srcObject = stream;
+      post({ type: 'remote-track' });
+    };
+    pc.onconnectionstatechange = function () {
+      post({ type: 'pc-state', state: pc.connectionState });
+    };
+    return pc;
+  }
+
+  async function start(msg) {
+    parentOrigin = msg.parentOrigin || '*';
+    setStatus('Richiesta microfono/camera…');
+    var iceServers = msg.iceServers || [];
+    var peer = await ensurePc(iceServers);
+    localStream = await getMedia(msg.audio !== false, msg.video !== false);
+    localEl.srcObject = localStream;
+    localStream.getTracks().forEach(function (t) { peer.addTrack(t, localStream); });
+    post({ type: 'media-ok', hasVideo: localStream.getVideoTracks().length > 0 });
+
+    if (msg.asOfferer) {
+      setStatus('Creazione offer…');
+      var offer = await peer.createOffer();
+      await peer.setLocalDescription(offer);
+      post({ type: 'signal', signal: { sdp: peer.localDescription } });
+      setStatus('In chiamata (offer inviata)');
+    } else {
+      setStatus('In attesa answer/offer…');
+    }
+  }
+
+  async function handleSignal(signal) {
+    if (!pc) await ensurePc([]);
+    if (signal.sdp) {
+      await pc.setRemoteDescription(signal.sdp);
+      if (signal.sdp.type === 'offer') {
+        if (!localStream) {
+          localStream = await getMedia(true, true);
+          localEl.srcObject = localStream;
+          localStream.getTracks().forEach(function (t) { pc.addTrack(t, localStream); });
+          post({ type: 'media-ok', hasVideo: localStream.getVideoTracks().length > 0 });
+        }
+        var answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        post({ type: 'signal', signal: { sdp: pc.localDescription } });
+        setStatus('In chiamata (answer inviata)');
+      } else {
+        setStatus('In chiamata');
+      }
+    } else if (signal.candidate) {
+      try { await pc.addIceCandidate(signal.candidate); } catch (e) { /* ignore */ }
+    }
+  }
+
+  function setMuted(muted) {
+    if (!localStream) return;
+    localStream.getAudioTracks().forEach(function (t) { t.enabled = !muted; });
+  }
+
+  function setCamOff(off) {
+    if (!localStream) return;
+    localStream.getVideoTracks().forEach(function (t) { t.enabled = !off; });
+  }
+
+  async function shareScreen(on) {
+    if (!pc) return;
+    if (!on) {
+      if (screenStream) {
+        screenStream.getTracks().forEach(function (t) { t.stop(); });
+        screenStream = null;
+      }
+      var cam = localStream && localStream.getVideoTracks()[0];
+      var sender = pc.getSenders().find(function (s) { return s.track && s.track.kind === 'video'; });
+      if (sender && cam) await sender.replaceTrack(cam);
+      setStatus('Camera ripristinata');
+      return;
+    }
+    screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+    var track = screenStream.getVideoTracks()[0];
+    var sender2 = pc.getSenders().find(function (s) { return s.track && s.track.kind === 'video'; });
+    if (sender2 && track) await sender2.replaceTrack(track);
+    track.onended = function () { shareScreen(false); post({ type: 'share-ended' }); };
+    setStatus('Condivisione schermo attiva');
+  }
+
+  function end() {
+    try {
+      if (localStream) localStream.getTracks().forEach(function (t) { t.stop(); });
+      if (screenStream) screenStream.getTracks().forEach(function (t) { t.stop(); });
+      if (pc) pc.close();
+    } catch (e) { /* ignore */ }
+    localStream = null;
+    screenStream = null;
+    pc = null;
+    localEl.srcObject = null;
+    remoteEl.srcObject = null;
+    setStatus('Chiamata terminata');
+  }
+
+  window.addEventListener('message', function (ev) {
+    var data = ev.data;
+    if (!data || data.target !== 'quote-call-bridge') return;
+    parentOrigin = ev.origin || parentOrigin;
+    var p = Promise.resolve();
+    if (data.type === 'start') p = start(data);
+    else if (data.type === 'signal') p = handleSignal(data.signal || {});
+    else if (data.type === 'mute') setMuted(!!data.muted);
+    else if (data.type === 'cam') setCamOff(!!data.camOff);
+    else if (data.type === 'share') p = shareScreen(!!data.on);
+    else if (data.type === 'end') end();
+    Promise.resolve(p).catch(function (err) {
+      setStatus(String(err && err.message || err), true);
+      post({ type: 'error', message: String(err && err.message || err) });
+    });
+  });
+
+  post({ type: 'ready' });
+  setStatus('Bridge HTTPS pronto — in attesa del parent');
+})();
+  </script>
+</body>
+</html>

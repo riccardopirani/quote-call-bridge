@@ -12,19 +12,22 @@
     video#local { position: absolute; right: 12px; bottom: 12px; width: 28%; max-width: 220px; border-radius: 10px; border: 1px solid #2e3d4f; }
     .status { padding: 8px 12px; font-size: 12px; color: #8fa3b8; border-top: 1px solid #2e3d4f; }
     .err { color: #e05555; }
+    .hint { padding: 6px 12px; font-size: 11px; color: #8696a0; }
   </style>
 </head>
 <body>
   <div class="wrap">
     <div class="videos">
-      <video id="remote" autoplay playsinline></video>
+      <video id="remote" autoplay playsInline></video>
       <video id="local" autoplay playsinline muted></video>
     </div>
-    <div class="status" id="status">Bridge pronto (HTTPS)…</div>
+    <div class="status" id="status">Bridge HTTPS pronto…</div>
+    <div class="hint" id="diag"></div>
   </div>
   <script>
 (function () {
   var statusEl = document.getElementById('status');
+  var diagEl = document.getElementById('diag');
   var localEl = document.getElementById('local');
   var remoteEl = document.getElementById('remote');
   var pc = null;
@@ -37,18 +40,45 @@
     statusEl.className = 'status' + (isErr ? ' err' : '');
   }
 
+  function diag() {
+    var secure = false;
+    try { secure = !!window.isSecureContext; } catch (e) {}
+    var hasMd = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+    diagEl.textContent =
+      'secure=' + secure +
+      ' · mediaDevices=' + hasMd +
+      ' · proto=' + location.protocol +
+      ' · opener=' + !!(window.opener && !window.opener.closed);
+  }
+  diag();
+
   function post(msg) {
     try {
-      if (window.parent && window.parent !== window) {
-        window.parent.postMessage(Object.assign({ source: 'quote-call-bridge' }, msg), parentOrigin);
-      }
+      var payload = Object.assign({ source: 'quote-call-bridge' }, msg);
+      var target = null;
+      if (window.opener && !window.opener.closed) target = window.opener;
+      else if (window.parent && window.parent !== window) target = window.parent;
+      if (target) target.postMessage(payload, parentOrigin === '*' ? '*' : parentOrigin);
     } catch (e) { /* ignore */ }
   }
 
   async function getMedia(audio, video) {
+    diag();
     var md = navigator.mediaDevices;
     if (!md || typeof md.getUserMedia !== 'function') {
-      throw new Error('getUserMedia non disponibile nel bridge');
+      var legacy = navigator.getUserMedia || navigator.webkitGetUserMedia || navigator.mozGetUserMedia;
+      if (legacy) {
+        return new Promise(function (resolve, reject) {
+          legacy.call(navigator, { audio: !!audio, video: !!video }, resolve, reject);
+        });
+      }
+      throw new Error(
+        'getUserMedia non disponibile (secure=' +
+          !!window.isSecureContext +
+          ', proto=' +
+          location.protocol +
+          '). Usa la finestra popup HTTPS e consenti mic/camera.'
+      );
     }
     try {
       return await md.getUserMedia({ audio: !!audio, video: !!video });
@@ -94,8 +124,9 @@
       post({ type: 'signal', signal: { sdp: peer.localDescription } });
       setStatus('In chiamata (offer inviata)');
     } else {
-      setStatus('In attesa answer/offer…');
+      setStatus('In attesa segnalazione…');
     }
+    diag();
   }
 
   async function handleSignal(signal) {
@@ -144,6 +175,9 @@
       setStatus('Camera ripristinata');
       return;
     }
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+      throw new Error('Condivisione schermo non disponibile');
+    }
     screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
     var track = screenStream.getVideoTracks()[0];
     var sender2 = pc.getSenders().find(function (s) { return s.track && s.track.kind === 'video'; });
@@ -163,7 +197,7 @@
     pc = null;
     localEl.srcObject = null;
     remoteEl.srcObject = null;
-    setStatus('Chiamata terminata');
+    setStatus('Chiamata terminata — puoi chiudere questa finestra');
   }
 
   window.addEventListener('message', function (ev) {
@@ -184,7 +218,9 @@
   });
 
   post({ type: 'ready' });
-  setStatus('Bridge HTTPS pronto — in attesa del parent');
+  setStatus('Bridge HTTPS pronto — in attesa del portale Quote');
+  // Re-announce ready (popup può caricarsi dopo il listener del parent)
+  setTimeout(function () { post({ type: 'ready' }); }, 400);
 })();
   </script>
 </body>
